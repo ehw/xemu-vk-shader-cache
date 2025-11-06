@@ -300,7 +300,7 @@ static void block_to_uniforms(const SpvReflectBlockVariable *block, ShaderUnifor
     // fprintf(stderr, "--\n");
 }
 
-static void init_layout_from_spv(ShaderModuleInfo *info)
+void init_layout_from_spv(ShaderModuleInfo *info)
 {
     SpvReflectResult result = spvReflectCreateShaderModule(
         info->spirv->len, info->spirv->data, &info->reflect_module);
@@ -389,7 +389,19 @@ static void finalize_uniform_layout(ShaderUniformLayout *layout)
 
 void pgraph_vk_ref_shader_module(ShaderModuleInfo *info)
 {
-    info->refcnt++;
+    fprintf(stderr, "nv2a: pgraph_vk_ref_shader_module called with info: %p\n", (void*)info);
+    if (info) {
+        fprintf(stderr, "nv2a: Current refcnt: %d\n", info->refcnt);
+        fprintf(stderr, "nv2a: Module has SPIR-V: %s\n", info->spirv ? "YES" : "NO");
+        if (info->spirv) {
+            fprintf(stderr, "nv2a: SPIR-V size: %u bytes\n", info->spirv->len);
+        }
+        fprintf(stderr, "nv2a: About to increment refcnt\n");
+        info->refcnt++;
+        fprintf(stderr, "nv2a: New refcnt: %d\n", info->refcnt);
+    } else {
+        fprintf(stderr, "nv2a: ERROR - NULL info passed to pgraph_vk_ref_shader_module\n");
+    }
 }
 
 void pgraph_vk_unref_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info)
