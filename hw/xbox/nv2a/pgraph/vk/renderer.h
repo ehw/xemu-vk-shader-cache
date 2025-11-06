@@ -409,6 +409,11 @@ typedef struct PGRAPHVkState {
     Lru shader_module_cache;
     ShaderModuleCacheEntry *shader_module_cache_entries;
 
+    // Shader cache synchronization
+    QemuMutex shader_cache_lock;
+    bool shader_cache_writeback_pending;
+    QemuEvent shader_cache_writeback_complete;
+
     // FIXME: Merge these into a structure
     uint64_t uniform_buffer_hashes[2];
     size_t uniform_buffer_offsets[2];
@@ -428,6 +433,9 @@ typedef struct PGRAPHVkState {
 
     PGRAPHVkDisplayState display;
     PGRAPHVkComputeState compute;
+
+    // Reference to parent PGRAPHState for cache operations
+    struct PGRAPHState *current_pg_state;
 } PGRAPHVkState;
 
 // renderer.c
@@ -467,6 +475,7 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
 void pgraph_vk_ref_shader_module(ShaderModuleInfo *info);
 void pgraph_vk_unref_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
 void pgraph_vk_destroy_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
+void init_layout_from_spv(ShaderModuleInfo *info);
 
 // buffer.c
 void pgraph_vk_init_buffers(NV2AState *d);
@@ -555,6 +564,7 @@ void pgraph_vk_init_shaders(PGRAPHState *pg);
 void pgraph_vk_finalize_shaders(PGRAPHState *pg);
 void pgraph_vk_update_descriptor_sets(PGRAPHState *pg);
 void pgraph_vk_bind_shaders(PGRAPHState *pg);
+void pgraph_vk_shader_cache_write_reload_list(PGRAPHState *pg);
 
 // reports.c
 void pgraph_vk_init_reports(PGRAPHState *pg);
