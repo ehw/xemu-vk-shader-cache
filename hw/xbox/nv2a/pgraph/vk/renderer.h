@@ -43,6 +43,8 @@
 
 #define HAVE_EXTERNAL_MEMORY 1
 
+typedef struct PGRAPHState PGRAPHState;
+
 typedef struct QueueFamilyIndices {
     int queue_family;
 } QueueFamilyIndices;
@@ -435,7 +437,7 @@ typedef struct PGRAPHVkState {
     PGRAPHVkComputeState compute;
 
     // Reference to parent PGRAPHState for cache operations
-    struct PGRAPHState *current_pg_state;
+    PGRAPHState *current_pg_state;
 } PGRAPHVkState;
 
 // renderer.c
@@ -475,7 +477,7 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
 void pgraph_vk_ref_shader_module(ShaderModuleInfo *info);
 void pgraph_vk_unref_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
 void pgraph_vk_destroy_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
-void init_layout_from_spv(ShaderModuleInfo *info);
+void pgraph_vk_init_layout_from_spv(ShaderModuleInfo *info);
 
 // buffer.c
 void pgraph_vk_init_buffers(NV2AState *d);
