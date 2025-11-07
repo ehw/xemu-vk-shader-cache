@@ -253,25 +253,11 @@ static bool shader_vk_load_from_disk(PGRAPHState *pg, uint64_t hash, ShaderModul
     
     *out_module = info;
     if (*out_module == NULL) {
-        // This should never happen, but just in case
         // Failed to create ShaderModuleInfo structure
         vkDestroyShaderModule(r->device, info->module, NULL);
         g_free(info);
         return false;
     }
-    
-
-    
-    // spirv_data is now owned by the ShaderModuleInfo structure, don't unref it
-    
-
-
-    
-
-    
-
-
-    
     return true;
 
 error:
@@ -365,13 +351,10 @@ static void shader_vk_cache_to_disk(ShaderModuleCacheEntry *module)
         return;
     }
 
-
-    
+ 
     // Call the write function directly instead of in a background thread
     // This ensures shaders are saved before program exits
     shader_vk_write_to_disk(module);
-    
-
 }
 
 // Cache writeback function for shutdown

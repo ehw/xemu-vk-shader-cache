@@ -300,7 +300,7 @@ static void block_to_uniforms(const SpvReflectBlockVariable *block, ShaderUnifor
     // fprintf(stderr, "--\n");
 }
 
-void init_layout_from_spv(ShaderModuleInfo *info)
+void pgraph_vk_init_layout_from_spv(ShaderModuleInfo *info)
 {
     SpvReflectResult result = spvReflectCreateShaderModule(
         info->spirv->len, info->spirv->data, &info->reflect_module);
@@ -373,7 +373,7 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
     info->spirv = pgraph_vk_compile_glsl_to_spv(
         vk_shader_stage_to_glslang_stage(stage), glsl);
     info->module = pgraph_vk_create_shader_module_from_spv(r, info->spirv);
-    init_layout_from_spv(info);
+    pgraph_vk_init_layout_from_spv(info);
     return info;
 }
 
@@ -389,19 +389,7 @@ static void finalize_uniform_layout(ShaderUniformLayout *layout)
 
 void pgraph_vk_ref_shader_module(ShaderModuleInfo *info)
 {
-    fprintf(stderr, "nv2a: pgraph_vk_ref_shader_module called with info: %p\n", (void*)info);
-    if (info) {
-        fprintf(stderr, "nv2a: Current refcnt: %d\n", info->refcnt);
-        fprintf(stderr, "nv2a: Module has SPIR-V: %s\n", info->spirv ? "YES" : "NO");
-        if (info->spirv) {
-            fprintf(stderr, "nv2a: SPIR-V size: %u bytes\n", info->spirv->len);
-        }
-        fprintf(stderr, "nv2a: About to increment refcnt\n");
-        info->refcnt++;
-        fprintf(stderr, "nv2a: New refcnt: %d\n", info->refcnt);
-    } else {
-        fprintf(stderr, "nv2a: ERROR - NULL info passed to pgraph_vk_ref_shader_module\n");
-    }
+    info->refcnt++;
 }
 
 void pgraph_vk_unref_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info)
