@@ -567,6 +567,7 @@ void pgraph_vk_finalize_shaders(PGRAPHState *pg);
 void pgraph_vk_update_descriptor_sets(PGRAPHState *pg);
 void pgraph_vk_bind_shaders(PGRAPHState *pg);
 void pgraph_vk_shader_cache_write_reload_list(PGRAPHState *pg);
+bool shader_vk_cache_enabled(void);
 
 // reports.c
 void pgraph_vk_init_reports(PGRAPHState *pg);

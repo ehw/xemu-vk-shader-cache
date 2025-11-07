@@ -37,7 +37,7 @@ static const char *shader_vk_get_base_path(void)
     return xemu_settings_get_base_path();
 }
 
-static bool shader_vk_cache_enabled(void)
+bool shader_vk_cache_enabled(void)
 {
     #ifdef HAVE_UI_SETTINGS
     extern struct config g_config;
@@ -248,6 +248,52 @@ static void lru_write_hash_callback(Lru *lru, LruNode *node, void *opaque)
     fwrite(&node->hash, sizeof(uint64_t), 1, lru_list_file);
 }
 
+struct write_data {
+    FILE *file;
+    GHashTable *existing_hashes;
+    GHashTable *added_hashes;
+};
+
+static void lru_check_and_write_hash_callback(Lru *lru, LruNode *node, void *opaque)
+{
+    struct write_data *data = (struct write_data*) opaque;
+    uint64_t hash = node->hash;
+    
+    if (!g_hash_table_contains(data->existing_hashes, (gpointer)hash) &&
+        !g_hash_table_contains(data->added_hashes, (gpointer)hash)) {
+        fwrite(&hash, sizeof(uint64_t), 1, data->file);
+        g_hash_table_add(data->added_hashes, (gpointer)hash);
+    }
+}
+
+static void shader_vk_reload_lru_from_disk(PGRAPHState *pg)
+{
+    if (!shader_vk_cache_enabled()) {
+        return;
+    }
+
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    char *shader_lru_path = shader_vk_get_lru_cache_path();
+
+    FILE *lru_shaders_list = qemu_fopen(shader_lru_path, "rb");
+    g_free(shader_lru_path);
+    if (!lru_shaders_list) {
+        return;
+    }
+
+    uint64_t hash;
+    while (fread(&hash, sizeof(uint64_t), 1, lru_shaders_list) == 1) {
+        ShaderModuleInfo *cached_module = NULL;
+        if (shader_vk_load_from_disk(pg, hash, &cached_module)) {
+            NV2A_VK_DPRINTF("Loaded cached shader from disk (hash: %llx)", 
+                          (unsigned long long)hash);
+        } else {
+        }
+    }
+
+    fclose(lru_shaders_list);
+}
+
 void pgraph_vk_shader_cache_write_reload_list(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -260,14 +306,34 @@ void pgraph_vk_shader_cache_write_reload_list(PGRAPHState *pg)
 
     char *shader_lru_path = shader_vk_get_lru_cache_path();
 
-    FILE *lru_list = qemu_fopen(shader_lru_path, "wb");
+    GHashTable *existing_hashes = g_hash_table_new(g_direct_hash, g_direct_equal);
+    FILE *existing_list = qemu_fopen(shader_lru_path, "rb");
+    if (existing_list) {
+        uint64_t hash;
+        while (fread(&hash, sizeof(uint64_t), 1, existing_list) == 1) {
+            g_hash_table_add(existing_hashes, (gpointer)hash);
+        }
+        fclose(existing_list);
+    }
+
+    FILE *lru_list = qemu_fopen(shader_lru_path, "ab");
     g_free(shader_lru_path);
     if (!lru_list) {
+        g_hash_table_destroy(existing_hashes);
         return;
     }
 
-    lru_visit_active(&r->shader_module_cache, lru_write_hash_callback, lru_list);
+    // Only write hashes that aren't already in the persistent list
+    GHashTable *added_hashes = g_hash_table_new(g_direct_hash, g_direct_equal);
+    lru_visit_active(&r->shader_module_cache, lru_check_and_write_hash_callback, 
+                     &(struct write_data){.file = lru_list, .existing_hashes = existing_hashes, .added_hashes = added_hashes});
+    
     fclose(lru_list);
+    g_hash_table_destroy(existing_hashes);
+    g_hash_table_destroy(added_hashes);
+    
+    qatomic_set(&r->shader_cache_writeback_pending, false);
+    qemu_event_set(&r->shader_cache_writeback_complete);
 }
 
 static void create_descriptor_pool(PGRAPHState *pg)
@@ -820,6 +886,8 @@ void pgraph_vk_init_shaders(PGRAPHState *pg)
     create_descriptor_set_layout(pg);
     create_descriptor_sets(pg);
     shader_cache_init(pg);
+	
+    shader_vk_reload_lru_from_disk(pg);
 
     r->use_push_constants_for_uniform_attrs =
         (r->device_props.limits.maxPushConstantsSize >=
