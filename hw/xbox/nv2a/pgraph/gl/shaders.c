@@ -255,14 +255,14 @@ static const char *shader_gl_vendor = NULL;
 
 static void shader_create_cache_folder(void)
 {
-    char *shader_path = g_strdup_printf("%sshaders", xemu_settings_get_base_path());
+    char *shader_path = g_strdup_printf("%sshaders/gl", xemu_settings_get_base_path());
     qemu_mkdir(shader_path);
     g_free(shader_path);
 }
 
 static char *shader_get_lru_cache_path(void)
 {
-    return g_strdup_printf("%s/shader_cache_list", xemu_settings_get_base_path());
+    return g_strdup_printf("%s/shaders/gl/shader_cache_list", xemu_settings_get_base_path());
 }
 
 static void shader_write_lru_list_entry_to_disk(Lru *lru, LruNode *node, void *opaque)
@@ -357,7 +357,7 @@ static char *shader_get_bin_directory(uint64_t hash)
 {
     const char *cfg_dir = xemu_settings_get_base_path();
     char *shader_bin_dir =
-        g_strdup_printf("%s/shaders/%04x", cfg_dir, (uint32_t)(hash >> 48));
+        g_strdup_printf("%s/shaders/gl/%04x", cfg_dir, (uint32_t)(hash >> 48));
     return shader_bin_dir;
 }
 
