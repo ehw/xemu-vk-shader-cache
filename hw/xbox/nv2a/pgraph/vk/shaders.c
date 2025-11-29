@@ -21,12 +21,320 @@
 #include "qemu/fast-hash.h"
 #include "qemu/mstring.h"
 #include "renderer.h"
+#include "xemu-version.h"
 
 #define VSH_UBO_BINDING 0
 #define PSH_UBO_BINDING 1
 #define PSH_TEX_BINDING 2
 
 const size_t MAX_UNIFORM_ATTR_VALUES_SIZE = NV2A_VERTEXSHADER_ATTRIBUTES * 4 * sizeof(float);
+
+static const char *shader_vk_driver = NULL;
+
+static const char *shader_vk_get_base_path(void)
+{
+    extern const char *xemu_settings_get_base_path(void);
+    return xemu_settings_get_base_path();
+}
+
+bool shader_vk_cache_enabled(void)
+{
+    #ifdef HAVE_UI_SETTINGS
+    extern struct config g_config;
+    return g_config.perf.cache_shaders;
+    #else
+    return true;
+    #endif
+}
+
+static void shader_vk_create_cache_folder(void)
+{
+    char *shader_path = g_strdup_printf("%sshaders/vk", shader_vk_get_base_path());
+    qemu_mkdir(shader_path);
+    g_free(shader_path);
+}
+
+static char *shader_vk_get_cache_directory(uint64_t hash)
+{
+    const char *cfg_dir = shader_vk_get_base_path();
+    char *shader_cache_dir = g_build_filename(cfg_dir, "shaders", "vk",
+        g_strdup_printf("%04x", (uint32_t)(hash >> 48)), NULL);
+    return shader_cache_dir;
+}
+
+static char *shader_vk_get_lru_cache_path(void)
+{
+    return g_build_filename(shader_vk_get_base_path(), "shaders", "vk", "shader_cache_list", NULL);
+}
+static char *shader_vk_get_binary_path(const char *shader_cache_dir, uint64_t hash)
+{
+    uint64_t bin_mask = (uint64_t)0xffff << 48;
+    char *filename = g_strdup_printf("%012" PRIx64, hash & ~bin_mask);
+    char *result = g_build_filename(shader_cache_dir, filename, NULL);
+    g_free(filename);
+    return result;
+}
+
+static bool shader_vk_load_from_disk(PGRAPHState *pg, uint64_t hash, ShaderModuleInfo **out_module)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    
+    char *shader_cache_dir = shader_vk_get_cache_directory(hash);
+    char *shader_path = shader_vk_get_binary_path(shader_cache_dir, hash);
+    char *cached_xemu_version = NULL;
+    char *cached_vk_driver = NULL;
+    GByteArray *spirv_data = NULL;
+    uint8_t *temp_spirv_data = NULL;
+
+    uint64_t cached_xemu_version_len;
+    uint64_t vk_driver_len;
+    uint32_t spv_size;
+
+    g_free(shader_cache_dir);
+
+    FILE *shader_file = qemu_fopen(shader_path, "rb");
+    if (!shader_file) {
+        goto error;
+    }
+
+    #define VK_READ_OR_ERR(data, data_len) \
+        do { \
+            size_t nread = fread(data, data_len, 1, shader_file); \
+            if (nread != 1) { \
+                fclose(shader_file); \
+                goto error; \
+            } \
+        } while (0)
+
+    VK_READ_OR_ERR(&cached_xemu_version_len, sizeof(cached_xemu_version_len));
+
+    cached_xemu_version = g_malloc0(cached_xemu_version_len + 1);
+    VK_READ_OR_ERR(cached_xemu_version, cached_xemu_version_len);
+    if (strcmp(cached_xemu_version, xemu_version) != 0) {
+        fclose(shader_file);
+        goto error;
+    }
+
+    VK_READ_OR_ERR(&vk_driver_len, sizeof(vk_driver_len));
+
+    cached_vk_driver = g_malloc0(vk_driver_len);
+    VK_READ_OR_ERR(cached_vk_driver, vk_driver_len);
+    if (strcmp(cached_vk_driver, shader_vk_driver) != 0) {
+        fclose(shader_file);
+        goto error;
+    }
+
+    // Read only the hash of the key, not the entire key structure
+    uint64_t key_hash;
+    VK_READ_OR_ERR(&key_hash, sizeof(key_hash));
+    VK_READ_OR_ERR(&spv_size, sizeof(spv_size));
+
+    temp_spirv_data = g_malloc(spv_size);
+    VK_READ_OR_ERR(temp_spirv_data, (size_t)spv_size);
+    
+    spirv_data = g_byte_array_new_take(temp_spirv_data, spv_size);
+
+    #undef VK_READ_OR_ERR
+
+    fclose(shader_file);
+    g_free(shader_path);
+    g_free(cached_xemu_version);
+    g_free(cached_vk_driver);
+
+    // Create a proper ShaderModuleInfo structure for the loaded shader
+    ShaderModuleInfo *info = g_malloc0(sizeof(*info));
+    info->refcnt = 0;
+    info->spirv = spirv_data;
+    
+    // Create the Vulkan shader module
+    info->module = pgraph_vk_create_shader_module_from_spv(r, info->spirv);
+    if (info->module == VK_NULL_HANDLE) {
+        g_free(info);
+        return false;
+    }
+    
+    // Initialize reflection data for the loaded shader
+    pgraph_vk_init_layout_from_spv(info);
+    
+    *out_module = info;
+    return true;
+
+error:
+    /* Delete the shader so it won't be loaded again */
+    qemu_unlink(shader_path);
+    g_free(shader_path);
+    if (spirv_data) {
+        g_byte_array_unref(spirv_data);
+    } else if (temp_spirv_data) {
+        // temp_spirv_data was allocated but not yet converted to GByteArray
+        g_free(temp_spirv_data);
+    }
+    g_free(cached_xemu_version);
+    g_free(cached_vk_driver);
+    return false;
+}
+
+static void *shader_vk_write_to_disk(void *arg)
+{
+    ShaderModuleCacheEntry *module = (ShaderModuleCacheEntry*) arg;
+    
+    if (!shader_vk_cache_enabled()) {
+        return NULL;
+    }
+
+    char *shader_cache_dir = shader_vk_get_cache_directory(module->node.hash);
+    char *shader_path = shader_vk_get_binary_path(shader_cache_dir, module->node.hash);
+    
+    uint64_t vk_driver_len = (uint64_t) (strlen(shader_vk_driver) + 1);
+    uint64_t xemu_version_len = (uint64_t) (strlen(xemu_version) + 1);
+
+    qemu_mkdir(shader_cache_dir);
+    g_free(shader_cache_dir);
+
+    FILE *shader_file = qemu_fopen(shader_path, "wb");
+    if (!shader_file) {
+        goto error;
+    }
+
+    #define VK_WRITE_OR_ERR(data, data_size) \
+        do { \
+            size_t written = fwrite(data, data_size, 1, shader_file); \
+            if (written != 1) { \
+                fclose(shader_file); \
+                goto error; \
+            } \
+        } while (0)
+
+    VK_WRITE_OR_ERR(&xemu_version_len, sizeof(xemu_version_len));
+    VK_WRITE_OR_ERR(xemu_version, xemu_version_len);
+
+    VK_WRITE_OR_ERR(&vk_driver_len, sizeof(vk_driver_len));
+    VK_WRITE_OR_ERR(shader_vk_driver, vk_driver_len);
+
+    // Write the cache entry hash (already computed and stored in node)
+    VK_WRITE_OR_ERR(&module->node.hash, sizeof(module->node.hash));
+    
+    uint32_t spv_size = module->module_info->spirv->len;
+    VK_WRITE_OR_ERR(&spv_size, sizeof(spv_size));
+    VK_WRITE_OR_ERR(module->module_info->spirv->data, spv_size);
+
+    #undef VK_WRITE_OR_ERR
+
+    fclose(shader_file);
+    g_free(shader_path);
+
+    return NULL;
+
+error:
+    g_free(shader_path);
+    return NULL;
+}
+
+static void shader_vk_cache_to_disk(ShaderModuleCacheEntry *module)
+{
+    if (!shader_vk_cache_enabled()) {
+        return;
+    }
+
+ 
+    // Call the write function directly instead of in a background thread
+    // This ensures shaders are saved before program exits
+    shader_vk_write_to_disk(module);
+}
+
+static void lru_write_hash_callback(Lru *lru, LruNode *node, void *opaque)
+{
+    FILE *lru_list_file = (FILE*) opaque;
+    fwrite(&node->hash, sizeof(uint64_t), 1, lru_list_file);
+}
+
+struct write_data {
+    FILE *file;
+    GHashTable *existing_hashes;
+    GHashTable *added_hashes;
+};
+
+static void lru_check_and_write_hash_callback(Lru *lru, LruNode *node, void *opaque)
+{
+    struct write_data *data = (struct write_data*) opaque;
+    uint64_t hash = node->hash;
+    
+    if (!g_hash_table_contains(data->existing_hashes, (gpointer)hash) &&
+        !g_hash_table_contains(data->added_hashes, (gpointer)hash)) {
+        fwrite(&hash, sizeof(uint64_t), 1, data->file);
+        g_hash_table_add(data->added_hashes, (gpointer)hash);
+    }
+}
+
+static void shader_vk_reload_lru_from_disk(PGRAPHState *pg)
+{
+    if (!shader_vk_cache_enabled()) {
+        return;
+    }
+
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    char *shader_lru_path = shader_vk_get_lru_cache_path();
+
+    FILE *lru_shaders_list = qemu_fopen(shader_lru_path, "rb");
+    g_free(shader_lru_path);
+    if (!lru_shaders_list) {
+        return;
+    }
+
+    uint64_t hash;
+    while (fread(&hash, sizeof(uint64_t), 1, lru_shaders_list) == 1) {
+        ShaderModuleInfo *cached_module = NULL;
+        if (shader_vk_load_from_disk(pg, hash, &cached_module)) {
+            NV2A_VK_DPRINTF("Loaded cached shader from disk (hash: %llx)", 
+                          (unsigned long long)hash);
+        } else {
+        }
+    }
+
+    fclose(lru_shaders_list);
+}
+
+void pgraph_vk_shader_cache_write_reload_list(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    if (!shader_vk_cache_enabled()) {
+        qatomic_set(&r->shader_cache_writeback_pending, false);
+        qemu_event_set(&r->shader_cache_writeback_complete);
+        return;
+    }
+
+    char *shader_lru_path = shader_vk_get_lru_cache_path();
+
+    GHashTable *existing_hashes = g_hash_table_new(g_direct_hash, g_direct_equal);
+    FILE *existing_list = qemu_fopen(shader_lru_path, "rb");
+    if (existing_list) {
+        uint64_t hash;
+        while (fread(&hash, sizeof(uint64_t), 1, existing_list) == 1) {
+            g_hash_table_add(existing_hashes, (gpointer)hash);
+        }
+        fclose(existing_list);
+    }
+
+    FILE *lru_list = qemu_fopen(shader_lru_path, "ab");
+    g_free(shader_lru_path);
+    if (!lru_list) {
+        g_hash_table_destroy(existing_hashes);
+        return;
+    }
+
+    // Only write hashes that aren't already in the persistent list
+    GHashTable *added_hashes = g_hash_table_new(g_direct_hash, g_direct_equal);
+    lru_visit_active(&r->shader_module_cache, lru_check_and_write_hash_callback, 
+                     &(struct write_data){.file = lru_list, .existing_hashes = existing_hashes, .added_hashes = added_hashes});
+    
+    fclose(lru_list);
+    g_hash_table_destroy(existing_hashes);
+    g_hash_table_destroy(added_hashes);
+    
+    qatomic_set(&r->shader_cache_writeback_pending, false);
+    qemu_event_set(&r->shader_cache_writeback_complete);
+}
 
 static void create_descriptor_pool(PGRAPHState *pg)
 {
@@ -322,10 +630,26 @@ static bool shader_cache_entry_compare(Lru *lru, LruNode *node, const void *key)
 static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
                                            const void *key)
 {
+
+    
     PGRAPHVkState *r = container_of(lru, PGRAPHVkState, shader_module_cache);
     ShaderModuleCacheEntry *module =
         container_of(node, ShaderModuleCacheEntry, node);
     memcpy(&module->key, key, sizeof(ShaderModuleCacheKey));
+    
+
+
+    if (shader_vk_cache_enabled() && r->current_pg_state) {
+        ShaderModuleInfo *cached_module = NULL;
+        if (shader_vk_load_from_disk(r->current_pg_state, node->hash, &cached_module)) {
+            NV2A_VK_DPRINTF("Vulkan shader cache hit for hash %llx", (unsigned long long)node->hash);
+            module->module_info = cached_module;
+            pgraph_vk_ref_shader_module(module->module_info);
+            return;
+        }
+    }
+
+    NV2A_VK_DPRINTF("Vulkan shader cache miss - compiling shader");
 
     MString *code;
 
@@ -349,8 +673,17 @@ static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
 
     module->module_info = pgraph_vk_create_shader_module_from_glsl(
         r, module->key.kind, mstring_get_str(code));
+    if (module->module_info) {
+    } else {
+        // Failed to compile shader
+    }
     pgraph_vk_ref_shader_module(module->module_info);
     mstring_unref(code);
+
+    // Save to persistent cache after successful compilation if caching is enabled
+    if (shader_vk_cache_enabled() && r->current_pg_state) {
+        shader_vk_cache_to_disk(module);
+    }
 }
 
 static void shader_module_cache_entry_post_evict(Lru *lru, LruNode *node)
@@ -373,6 +706,21 @@ static bool shader_module_cache_entry_compare(Lru *lru, LruNode *node,
 static void shader_cache_init(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
+
+    // Initialize Vulkan shader cache locking
+    qemu_mutex_init(&r->shader_cache_lock);
+    qemu_event_init(&r->shader_cache_writeback_complete, false);
+    r->shader_cache_writeback_pending = false;
+
+    // Set up Vulkan driver info for cache compatibility checking
+    if (!shader_vk_driver) {
+        shader_vk_driver = (const char *) r->device_props.deviceName;
+    }
+
+    // Create shader cache directory
+    if (shader_vk_cache_enabled()) {
+        shader_vk_create_cache_folder();
+    }
 
     const size_t shader_cache_size = 1024;
     lru_init(&r->shader_cache);
@@ -406,6 +754,11 @@ static void shader_cache_finalize(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    // Save Vulkan shader cache before cleanup
+    if (shader_vk_cache_enabled()) {
+        pgraph_vk_shader_cache_write_reload_list(pg);
+    }
+
     lru_flush(&r->shader_cache);
     g_free(r->shader_cache_entries);
     r->shader_cache_entries = NULL;
@@ -413,6 +766,10 @@ static void shader_cache_finalize(PGRAPHState *pg)
     lru_flush(&r->shader_module_cache);
     g_free(r->shader_module_cache_entries);
     r->shader_module_cache_entries = NULL;
+
+    // Clean up Vulkan cache synchronization primitives
+    qemu_mutex_destroy(&r->shader_cache_lock);
+    qemu_event_destroy(&r->shader_cache_writeback_complete);
 }
 
 static ShaderBinding *get_shader_binding_for_state(PGRAPHVkState *r,
@@ -521,11 +878,16 @@ void pgraph_vk_init_shaders(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    // Set reference to parent PGRAPHState for cache operations
+    r->current_pg_state = pg;
+
     pgraph_vk_init_glsl_compiler();
     create_descriptor_pool(pg);
     create_descriptor_set_layout(pg);
     create_descriptor_sets(pg);
     shader_cache_init(pg);
+	
+    shader_vk_reload_lru_from_disk(pg);
 
     r->use_push_constants_for_uniform_attrs =
         (r->device_props.limits.maxPushConstantsSize >=
